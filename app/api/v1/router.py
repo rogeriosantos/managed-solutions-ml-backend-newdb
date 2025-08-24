@@ -3,7 +3,7 @@ Main API router for v1 endpoints
 """
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import data, ml, analytics
+from app.api.v1.endpoints import data, ml, analytics, maintenance
 
 api_router = APIRouter()
 
@@ -11,3 +11,4 @@ api_router = APIRouter()
 api_router.include_router(data.router, prefix="/data", tags=["data"])
 api_router.include_router(ml.router, prefix="/ml", tags=["machine-learning"])
 api_router.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
+api_router.include_router(maintenance.router, prefix="/maintenance", tags=["predictive-maintenance"])
