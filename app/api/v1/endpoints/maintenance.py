@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 from app.core.database import get_postgres_db
 from app.models.analytics import JobRecord
+from app.services.predictive_maintenance_service import PredictiveMaintenanceService
 
 router = APIRouter()
 
@@ -328,3 +329,170 @@ async def get_machine_maintenance_detail(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error getting machine details: {str(e)}")
+
+@router.get("/maintenance/analysis")
+async def get_comprehensive_maintenance_analysis(
+    limit: int = Query(3000, description="Number of records to analyze", ge=100, le=5000),
+    postgres_db: AsyncSession = Depends(get_postgres_db)
+):
+    """
+    Run comprehensive predictive maintenance analysis using machine learning
+    
+    This endpoint performs:
+    - Maintenance pattern analysis
+    - ML-based prediction model training
+    - Anomaly detection
+    - Risk assessment and predictions
+    """
+    try:
+        service = PredictiveMaintenanceService()
+        
+        # Run comprehensive analysis
+        results = await service.run_comprehensive_analysis(postgres_db, limit=limit)
+        
+        return {
+            "status": "success",
+            "message": "Comprehensive maintenance analysis completed",
+            "results": results
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error running maintenance analysis: {str(e)}")
+
+@router.post("/maintenance/predict")
+async def predict_maintenance_timing(
+    machine_ids: Optional[List[str]] = None,
+    postgres_db: AsyncSession = Depends(get_postgres_db)
+):
+    """
+    Predict maintenance timing for specific machines or all machines
+    """
+    try:
+        service = PredictiveMaintenanceService()
+        
+        # Fetch recent data for prediction
+        raw_data = await service.fetch_data(postgres_db, limit=1000)
+        processed_data = service.preprocess_data(raw_data)
+        
+        # Train model if not already trained
+        if service.model is None:
+            service.build_prediction_model(processed_data)
+        
+        # Filter by machine IDs if provided
+        if machine_ids:
+            processed_data = processed_data[processed_data['machine_id'].isin(machine_ids)]
+        
+        # Generate predictions
+        predictions = service.generate_predictions(processed_data, sample_size=len(machine_ids) if machine_ids else 10)
+        
+        return {
+            "status": "success",
+            "predictions": predictions,
+            "prediction_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error predicting maintenance: {str(e)}")
+
+@router.get("/maintenance/machine/{machine_id}/schedule")
+async def get_machine_maintenance_schedule(
+    machine_id: str,
+    days_ahead: int = Query(30, description="Days to predict ahead", ge=1, le=90),
+    postgres_db: AsyncSession = Depends(get_postgres_db)
+):
+    """
+    Get predicted maintenance schedule for a specific machine
+    """
+    try:
+        import pandas as pd
+        
+        service = PredictiveMaintenanceService()
+        
+        # Fetch machine-specific data
+        result = await postgres_db.execute(text("""
+            SELECT 
+                machine_id,
+                job_number,
+                start_time,
+                job_duration,
+                running_time,
+                setup_time,
+                idle_time,
+                maintenance_time,
+                parts_produced,
+                emp_id,
+                CASE WHEN job_duration > 0 THEN running_time::float / job_duration ELSE 0 END as efficiency
+            FROM job_records
+            WHERE machine_id = :machine_id
+            ORDER BY start_time DESC
+            LIMIT 100
+        """), {"machine_id": machine_id})
+        
+        machine_data = [dict(row._mapping) for row in result]
+        
+        if not machine_data:
+            raise HTTPException(status_code=404, detail=f"No data found for machine {machine_id}")
+        
+        # Process data and make predictions
+        df = service.preprocess_data(pd.DataFrame(machine_data))
+        
+        # Train model with broader dataset if needed
+        if service.model is None:
+            broader_data = await service.fetch_data(postgres_db, limit=1000)
+            broader_df = service.preprocess_data(broader_data)
+            service.build_prediction_model(broader_df)
+        
+        # Get latest record for prediction
+        latest_record = df.iloc[-1]
+        
+        feature_columns = [
+            'job_duration', 'setup_time', 'idle_time', 'parts_produced',
+            'efficiency', 'hour', 'day_of_week', 'month',
+            'setup_ratio', 'idle_ratio', 'maintenance_time_ma7', 
+            'efficiency_ma7', 'setup_time_ma7'
+        ]
+        
+        features = latest_record[feature_columns].values.reshape(1, -1)
+        features_scaled = service.scaler.transform(features)
+        predicted_maintenance = service.model.predict(features_scaled)[0]
+        
+        # Calculate maintenance schedule
+        current_efficiency = latest_record['efficiency']
+        maintenance_history = df['maintenance_time'].describe()
+        
+        # Determine next maintenance window
+        if predicted_maintenance > 3600:  # > 1 hour predicted
+            recommended_days = min(7, days_ahead)
+            priority = "HIGH"
+        elif predicted_maintenance > 1800:  # > 30 minutes
+            recommended_days = min(14, days_ahead)
+            priority = "MEDIUM"
+        else:
+            recommended_days = min(30, days_ahead)
+            priority = "LOW"
+        
+        next_maintenance_date = datetime.now() + timedelta(days=recommended_days)
+        
+        return {
+            "status": "success",
+            "machine_id": machine_id,
+            "maintenance_schedule": {
+                "predicted_maintenance_time_seconds": float(predicted_maintenance),
+                "recommended_maintenance_date": next_maintenance_date.isoformat(),
+                "priority": priority,
+                "days_until_maintenance": recommended_days,
+                "current_efficiency_percent": float(current_efficiency * 100),
+                "maintenance_history": {
+                    "mean_seconds": float(maintenance_history['mean']),
+                    "max_seconds": float(maintenance_history['max']),
+                    "frequency_percent": float(len(df[df['maintenance_time'] > 0]) / len(df) * 100)
+                }
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting maintenance schedule: {str(e)}")
